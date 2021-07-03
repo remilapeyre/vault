@@ -22,6 +22,7 @@ import (
 )
 
 const (
+	databaseCAPath         = "ca/"
 	databaseConfigPath     = "config/"
 	databaseRolePath       = "role/"
 	databaseStaticRolePath = "static-role/"
@@ -90,6 +91,7 @@ func Backend(conf *logical.BackendConfig) *databaseBackend {
 			pathRoles(&b),
 			pathCredsCreate(&b),
 			pathRotateRootCredentials(&b),
+			pathCA(&b),
 		),
 
 		Secrets: []*framework.Secret{
@@ -144,6 +146,11 @@ func (b *databaseBackend) DatabaseConfig(ctx context.Context, s logical.Storage,
 	var config DatabaseConfig
 	if err := entry.DecodeJSON(&config); err != nil {
 		return nil, err
+	}
+
+	config.ConnectionDetails, err = b.getConnectionDetails(config.ConnectionDetails, ctx, s)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get connection details: %w", err)
 	}
 
 	return &config, nil

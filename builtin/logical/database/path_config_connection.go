@@ -63,18 +63,21 @@ func (b *databaseBackend) pathConnectionReset() framework.OperationFunc {
 			return logical.ErrorResponse(respErrEmptyName), nil
 		}
 
-		// Close plugin and delete the entry in the connections cache.
-		if err := b.ClearConnection(name); err != nil {
-			return nil, err
-		}
-
-		// Execute plugin again, we don't need the object so throw away.
-		if _, err := b.GetConnection(ctx, req.Storage, name); err != nil {
-			return nil, err
-		}
+		b.resetConnection(ctx, req.Storage, name)
 
 		return nil, nil
 	}
+}
+
+func (b *databaseBackend) resetConnection(ctx context.Context, s logical.Storage, name string) error {
+	// Close plugin and delete the entry in the connections cache.
+	if err := b.ClearConnection(name); err != nil {
+		return err
+	}
+
+	// Execute plugin again, we don't need the object so throw away.
+	_, err := b.GetConnection(ctx, s, name)
+	return err
 }
 
 // pathConfigurePluginConnection returns a configured framework.Path setup to
@@ -112,8 +115,8 @@ func pathConfigurePluginConnection(b *databaseBackend) *framework.Path {
 			"root_rotation_statements": &framework.FieldSchema{
 				Type: framework.TypeStringSlice,
 				Description: `Specifies the database statements to be executed
-				to rotate the root user's credentials. See the plugin's API 
-				page for more information on support and formatting for this 
+				to rotate the root user's credentials. See the plugin's API
+				page for more information on support and formatting for this
 				parameter.`,
 			},
 			"password_policy": &framework.FieldSchema{
@@ -319,8 +322,12 @@ func (b *databaseBackend) connectionWriteHandler() framework.OperationFunc {
 			return logical.ErrorResponse("error creating database object: %s", err), nil
 		}
 
+		details, err := b.getConnectionDetails(config.ConnectionDetails, ctx, req.Storage)
+		if err != nil {
+			return logical.ErrorResponse(err.Error()), nil
+		}
 		initReq := v5.InitializeRequest{
-			Config:           config.ConnectionDetails,
+			Config:           details,
 			VerifyConnection: verifyConnection,
 		}
 		initResp, err := dbw.Initialize(ctx, initReq)
@@ -329,6 +336,8 @@ func (b *databaseBackend) connectionWriteHandler() framework.OperationFunc {
 			return logical.ErrorResponse("error creating database object: %s", err), nil
 		}
 		config.ConnectionDetails = initResp.Config
+		delete(config.ConnectionDetails, "sslcert")
+		delete(config.ConnectionDetails, "sslkey")
 
 		b.Lock()
 		defer b.Unlock()
@@ -383,6 +392,31 @@ func storeConfig(ctx context.Context, storage logical.Storage, name string, conf
 	return nil
 }
 
+func (b *databaseBackend) getConnectionDetails(details map[string]interface{}, ctx context.Context, s logical.Storage) (map[string]interface{}, error) {
+	res := make(map[string]interface{})
+	for k, v := range details {
+		res[k] = v
+	}
+
+	if strings.Contains(res["connection_url"].(string), "{{sslkey}}") ||
+	strings.Contains(res["connection_url"].(string), "{{sslcert}}") {
+		username, ok := res["username"]
+		if !ok {
+			return nil, fmt.Errorf("'username' must be when using certificate authentication")
+		}
+		cert, err := b.getOrGenerateCert(username.(string), ctx, s)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get cert: %w", err)
+		}
+
+		res["sslcert"] = cert.Certificate
+		res["sslkey"] = cert.PrivateKey
+	}
+
+
+	return res, nil
+}
+
 const pathConfigConnectionHelpSyn = `
 Configure connection details to a database plugin.
 `
@@ -391,7 +425,7 @@ const pathConfigConnectionHelpDesc = `
 This path configures the connection details used to connect to a particular
 database. This path runs the provided plugin name and passes the configured
 connection details to the plugin. See the documentation for the plugin specified
-for a full list of accepted connection details. 
+for a full list of accepted connection details.
 
 In addition to the database specific connection details, this endpoint also
 accepts:
